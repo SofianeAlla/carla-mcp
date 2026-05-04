@@ -16,7 +16,7 @@ Built for AD ML / perception engineers who want an LLM in the loop for scenario 
 
 ## Status
 
-**v2.1 — 49 tools shipped**, with a dedicated 3D / perception-eval suite. Covers the full AD ML loop:
+**v2.2 — 52 tools shipped**, including simulator-process orchestration so Claude can launch CARLA itself. The full AD ML loop, fully agentic:
 
 - World control, weather, spectator, traffic
 - All CARLA sensor types (RGB, depth, semantic, instance, optical flow, DVS, lidar, semantic lidar)
@@ -31,7 +31,16 @@ Built for AD ML / perception engineers who want an LLM in the loop for scenario 
 
 v2.5 / v3 roadmap in [ROADMAP.md](./ROADMAP.md).
 
-## Tools (49)
+## Tools (52)
+
+### Simulator orchestration (process-level)
+| Tool | What it does |
+| --- | --- |
+| `simulator_status` | Non-destructive probe: are any `CarlaUE4*` processes alive, and is port 2000 open? Returns `ready=true` when the next sim RPC will succeed. |
+| `start_simulator(carla_root?, quality_level, render_off_screen, wait_ready_seconds)` | Launches CARLA detached if it isn't already running, polls port 2000 until ready. Short-circuits with `already_running=true` when the simulator is already up — safe to call unconditionally as step 0 of any chain. |
+| `stop_simulator` | Terminates running `CarlaUE4*` processes (uses `taskkill` on Windows, `pkill` on Linux). |
+
+`carla_root` resolution order: explicit arg → `CARLA_ROOT` env var → `C:\Users\<USER>\CARLA_0.9.16` (Windows) → `~/carla` (Linux).
 
 ### World & control
 | Tool | What it does |
@@ -192,37 +201,38 @@ Then chat from claude.ai (web or mobile) and the model can drive your local CARL
 
 ## Usage examples
 
-With CARLA simulator running (double-click "CARLA Simulator" desktop shortcut), ask Claude.
+Just paste a prompt into Claude. v2.2 onwards, **Claude can start the CARLA simulator itself** via `start_simulator` — you don't need to launch the binary first. The tool short-circuits if it's already running, so it's safe to use unconditionally.
 
 ### Quick smoke test
 
-> Load Town03, set the weather to HardRainNoon, spawn a Tesla and 20 traffic vehicles, wait 3 seconds, then show me what the Tesla sees from the front camera.
+> Make sure CARLA is running (`start_simulator`). Then load Town03, set weather to HardRainNoon, spawn a Tesla and 20 traffic vehicles, wait 3 seconds, and show me what the Tesla sees from the front camera.
 
-Claude chains `load_map → set_weather → spawn_vehicle → spawn_traffic → wait → capture_sensor` and the rendered RGB frame appears inline.
+Claude chains `start_simulator → load_map → set_weather → spawn_vehicle → spawn_traffic → wait → capture_sensor` and the rendered RGB frame appears inline.
 
 ### End-to-end perception eval (the demo run)
 
-Paste this into a fresh chat. Produces ~6 inline images plus a KITTI label dump and an engineer-eye-view summary in roughly 60 seconds of execution.
+Paste this into a fresh chat. Produces ~6 inline images plus a KITTI label dump and an engineer-eye-view summary in roughly 60 seconds of execution (after the initial CARLA launch on first run; ~3 minutes if cold).
 
 > Set up an end-to-end perception eval in CARLA. Use the carla tools and chain them — don't ask me between steps:
 >
-> 1. Probe `world_status` to confirm the simulator is reachable. If not on `Town10HD_Opt`, call `load_map("Town10HD_Opt")`; otherwise skip the reload (avoids the cold-start `load_world()` cost on heavy maps).
-> 2. Set weather to `MidRainSunset`.
-> 3. **Populate the world first**: 25 traffic vehicles + 8 pedestrians, so the ego spawns into a live scene rather than empty streets.
-> 4. Wait 3 seconds for traffic to disperse onto the network.
-> 5. **Now spawn the ego**: a Tesla Model 3 with autopilot and `follow_with_spectator=True`. Keep its `actor_id`. The simulator window's spectator camera will continuously chase the moving Tesla (v2.1.2+).
-> 6. Wait another 2 seconds so the chase shot beds in.
-> 7. Front camera RGB, then `compare_seg_with_truth` for the semantic ⟷ BEV ground-truth side-by-side.
-> 8. Lidar perception: `render_lidar_3d` with `view="iso"`, then a BEV semantic raster via `capture_semantic_lidar`.
-> 9. `compute_lidar_stats` and report point count, max range, and ring uniformity.
-> 10. `extract_3d_bboxes` in KITTI format with `max_distance=80`. Show me the first 3 lines.
-> 11. Spawn an adversarial cut-in 15m ahead of the ego. Wait 3 seconds.
-> 12. Capture the front camera at the moment of the swerve — that's our "interesting frame".
-> 13. Reset the world.
+> 1. **Start the simulator** if it isn't already running: call `start_simulator()`. If it returns `already_running=true` proceed; if `started=true` it just launched and is ready.
+> 2. Probe `world_status`. If the current map isn't `Town10HD_Opt`, call `load_map("Town10HD_Opt")`; otherwise skip the reload (avoids the cold-start `load_world()` cost on heavy maps).
+> 3. Set weather to `MidRainSunset`.
+> 4. **Populate the world first**: 25 traffic vehicles + 8 pedestrians, so the ego spawns into a live scene rather than empty streets.
+> 5. Wait 3 seconds for traffic to disperse onto the network.
+> 6. **Now spawn the ego**: a Tesla Model 3 with autopilot and `follow_with_spectator=True`. Keep its `actor_id`. The simulator window's spectator camera continuously chases the moving Tesla (v2.1.2+).
+> 7. Wait another 2 seconds so the chase shot beds in.
+> 8. Front camera RGB, then `compare_seg_with_truth` for the semantic ⟷ BEV ground-truth side-by-side.
+> 9. Lidar perception: `render_lidar_3d` with `view="iso"`, then a BEV semantic raster via `capture_semantic_lidar`.
+> 10. `compute_lidar_stats` and report point count, max range, and ring uniformity.
+> 11. `extract_3d_bboxes` in KITTI format with `max_distance=80`. Show me the first 3 lines.
+> 12. Spawn an adversarial cut-in 15m ahead of the ego. Wait 3 seconds.
+> 13. Capture the front camera at the moment of the swerve — that's our "interesting frame".
+> 14. Reset the world.
 >
-> After step 12, summarize in one paragraph what an AD perception engineer would learn from this run.
+> After step 13, summarize in one paragraph what an AD perception engineer would learn from this run.
 
-For a different visual flavor, swap step 1 for `Town04` + `HardRainNoon` (highway loop, faster cut-in dynamics) or `Town07` + `CloudySunset` (rural countryside, vegetation-dominated BEV).
+For a different visual flavor, swap step 2 for `Town04` + `HardRainNoon` (highway loop, faster cut-in dynamics) or `Town07` + `CloudySunset` (rural countryside, vegetation-dominated BEV).
 
 ## Configuration
 

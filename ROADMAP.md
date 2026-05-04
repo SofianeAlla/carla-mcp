@@ -92,6 +92,16 @@ v1 (current) is the smallest surface that makes Claude useful inside CARLA. v2 b
 - [ ] `generate_opendrive(spec)` — programmatic road network creation
 - [ ] `import_osm(extract)` — convert OpenStreetMap regions to drivable maps
 
+## v2.2 — shipped (simulator orchestration)
+
+Three tools that let Claude manage the simulator process itself, so a session can start completely cold (no human launching CARLA in advance):
+
+- `simulator_status()` — non-destructive: report process PIDs + port-2000 reachability + a combined `ready` flag
+- `start_simulator(carla_root?, quality_level, render_off_screen, wait_ready_seconds)` — spawn detached if not running, poll until port opens; short-circuits with `already_running=true` so it's safe as step 0 of any chain
+- `stop_simulator()` — `taskkill` (Windows) / `pkill` (Linux) cleanup, returns the process names killed
+
+Resolution order for the install path: explicit `carla_root` → `CARLA_ROOT` env var → `C:\Users\<USER>\CARLA_0.9.16` (Windows) → `~/carla` (Linux).
+
 ## v2.1 — shipped (3D perception eval)
 
 Seven new tools that turn carla-mcp into a real perception-evaluation harness, using fields the semantic-lidar sensor already provides (per-point `ObjIdx` + `ObjTag`):

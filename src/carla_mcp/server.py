@@ -17,8 +17,11 @@ import argparse
 import io
 import json
 import os
+import platform
 import queue
 import random
+import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -382,6 +385,211 @@ WEATHER_PRESETS = {
     "SoftRainNoon": carla.WeatherParameters.SoftRainNoon,
     "SoftRainSunset": carla.WeatherParameters.SoftRainSunset,
 }
+
+
+# ====================================================================
+# Simulator orchestration (process-level, runs before any sim RPC)
+# ====================================================================
+
+def _port_listening(host: str, port: int, timeout: float = 1.5) -> bool:
+    """True if `host:port` accepts a TCP connection within `timeout` seconds."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def _carla_processes_alive() -> list[int]:
+    """Return PIDs of any running CarlaUE4 game / launcher processes."""
+    pids: list[int] = []
+    if platform.system() == "Windows":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq CarlaUE4-Win64-Shipping.exe", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=8,
+            )
+            for line in out.stdout.splitlines():
+                # CSV: "name","pid","session","sessionno","mem"
+                parts = [p.strip('"') for p in line.split(",")]
+                if len(parts) >= 2 and parts[0].lower().startswith("carlaue4"):
+                    try:
+                        pids.append(int(parts[1]))
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+    else:
+        try:
+            out = subprocess.run(["pgrep", "-f", "CarlaUE4"], capture_output=True, text=True, timeout=5)
+            pids = [int(p) for p in out.stdout.split() if p.strip().isdigit()]
+        except Exception:
+            pass
+    return pids
+
+
+@mcp.tool()
+def simulator_status() -> dict[str, Any]:
+    """Non-destructive check for whether the CARLA simulator is running and ready.
+
+    Reports whether any `CarlaUE4*` process is alive and whether the RPC port
+    (`CARLA_PORT`, default 2000) accepts a TCP connection. The combined
+    `ready=True` means the next sim RPC should succeed.
+    """
+    pids = _carla_processes_alive()
+    port_ok = _port_listening(_CARLA_HOST, _CARLA_PORT)
+    return {
+        "process_pids": pids,
+        "process_running": bool(pids),
+        "port": f"{_CARLA_HOST}:{_CARLA_PORT}",
+        "port_open": port_ok,
+        "ready": port_ok,
+    }
+
+
+@mcp.tool()
+def start_simulator(
+    carla_root: str | None = None,
+    quality_level: str = "Epic",
+    render_off_screen: bool = False,
+    wait_ready_seconds: float = 90.0,
+) -> dict[str, Any]:
+    """Launch the CARLA simulator if it isn't already running.
+
+    Short-circuits with `already_running=True` if port 2000 is already open
+    (so the demo prompt can call this unconditionally as step 0). Otherwise
+    spawns the simulator detached and polls the RPC port until ready.
+
+    Args:
+        carla_root: Path containing `CarlaUE4.exe` (Windows) or `CarlaUE4.sh`
+            (Linux). Falls back to the `CARLA_ROOT` env var, then
+            `C:\\Users\\<USER>\\CARLA_0.9.16` on Windows or `~/carla` on Linux.
+        quality_level: `Low` | `Epic`. `Low` ships ~50% the GPU cost.
+        render_off_screen: Headless launch (`-RenderOffScreen`). Use this on
+            cloud GPUs / SSH boxes where you don't have a display.
+        wait_ready_seconds: How long to poll port 2000 before giving up.
+            First-ever launch on a cold cache can take 3–5 minutes for shader
+            compilation; bump to 300 if you see timeouts on the first run.
+    """
+    # Already up? Don't double-launch.
+    if _port_listening(_CARLA_HOST, _CARLA_PORT):
+        existing = _carla_processes_alive()
+        return {
+            "started": False,
+            "already_running": True,
+            "process_pids": existing,
+            "port": f"{_CARLA_HOST}:{_CARLA_PORT}",
+            "wait_seconds": 0.0,
+        }
+
+    root_str = (
+        carla_root
+        or os.environ.get("CARLA_ROOT")
+        or (
+            os.path.expandvars(r"C:\Users\%USERNAME%\CARLA_0.9.16")
+            if platform.system() == "Windows"
+            else os.path.expanduser("~/carla")
+        )
+    )
+    root = Path(root_str)
+    if not root.exists():
+        raise RuntimeError(
+            f"CARLA root not found at {root}. Pass `carla_root` or set the "
+            f"`CARLA_ROOT` env var to the directory containing CarlaUE4.{'exe' if platform.system() == 'Windows' else 'sh'}."
+        )
+
+    if platform.system() == "Windows":
+        exe = root / "CarlaUE4.exe"
+    else:
+        exe = root / "CarlaUE4.sh"
+    if not exe.exists():
+        raise RuntimeError(f"Simulator executable not found at {exe}")
+
+    args = [str(exe)]
+    if quality_level:
+        args.extend(["-quality-level", quality_level])
+    if render_off_screen:
+        args.append("-RenderOffScreen")
+    if str(_CARLA_PORT) != "2000":
+        args.extend(["-carla-rpc-port", str(_CARLA_PORT)])
+
+    # Detach so the simulator survives the MCP subprocess.
+    if platform.system() == "Windows":
+        DETACHED_PROCESS = 0x00000008
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+        proc = subprocess.Popen(
+            args, cwd=str(root), creationflags=creationflags,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+        )
+    else:
+        proc = subprocess.Popen(
+            args, cwd=str(root), start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+        )
+
+    t0 = time.time()
+    deadline = t0 + max(5.0, float(wait_ready_seconds))
+    while time.time() < deadline:
+        if _port_listening(_CARLA_HOST, _CARLA_PORT, timeout=1.0):
+            return {
+                "started": True,
+                "already_running": False,
+                "pid": proc.pid,
+                "executable": str(exe),
+                "args": args[1:],
+                "port": f"{_CARLA_HOST}:{_CARLA_PORT}",
+                "wait_seconds": round(time.time() - t0, 1),
+            }
+        # If the process died early, surface that
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"Simulator exited with code {proc.returncode} during startup. "
+                f"Check the carla log file (typically `CarlaUE4/Saved/Logs/`)."
+            )
+        time.sleep(1.0)
+
+    raise RuntimeError(
+        f"Simulator started (PID {proc.pid}) but port {_CARLA_PORT} did not "
+        f"open within {wait_ready_seconds}s. First launches need 3–5 min for "
+        f"shader compilation — retry with `wait_ready_seconds=300`."
+    )
+
+
+@mcp.tool()
+def stop_simulator() -> dict[str, Any]:
+    """Terminate any running CarlaUE4 simulator process(es).
+
+    Safe to call when nothing is running (returns empty `killed` list).
+    Use this between recording takes or when the simulator gets wedged.
+    """
+    killed: list[str] = []
+    if platform.system() == "Windows":
+        for name in ("CarlaUE4-Win64-Shipping.exe", "CarlaUE4.exe"):
+            try:
+                out = subprocess.run(
+                    ["taskkill", "/F", "/IM", name],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if "SUCCESS" in (out.stdout or "").upper():
+                    killed.append(name)
+            except Exception:
+                pass
+    else:
+        try:
+            subprocess.run(["pkill", "-9", "-f", "CarlaUE4"], timeout=10, check=False)
+            killed.append("CarlaUE4*")
+        except Exception:
+            pass
+    # Give the OS a moment to release the port
+    time.sleep(0.5)
+    return {
+        "killed": killed,
+        "port_open_after": _port_listening(_CARLA_HOST, _CARLA_PORT, timeout=1.0),
+    }
 
 
 @mcp.tool()
