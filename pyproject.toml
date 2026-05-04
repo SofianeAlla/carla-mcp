@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "carla-mcp"
+version = "2.0.0"
+description = "MCP connector for the CARLA autonomous driving simulator. Gives Claude eyes (sensor capture) and hands (actor & scenario control) inside CARLA."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10,<3.13"
+authors = [{ name = "Sofiane Alla" }]
+keywords = ["carla", "mcp", "claude", "autonomous-driving", "simulation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "mcp[cli]>=1.2",
+  "carla==0.9.16",
+  "numpy<2.0.0",
+  "Pillow>=10",
+  "uvicorn>=0.30",
+  "starlette>=0.40",
+  "matplotlib>=3.7",
+  "scikit-learn>=1.3",  # DBSCAN for point_cloud_clusters
+  "open3d>=0.18",       # headless 3D point cloud renders
+]
+
+[project.scripts]
+carla-mcp = "carla_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/sofiane-alla/carla-mcp"
+Issues = "https://github.com/sofiane-alla/carla-mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carla_mcp"]

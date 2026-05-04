@@ -1,0 +1,201 @@
+# carla-mcp
+
+> MCP connector that gives Claude **eyes and hands** inside the [CARLA](https://carla.org) autonomous-driving simulator.
+
+A FastMCP server exposing CARLA's Python API as Claude tools: load maps, spawn vehicles and traffic, control weather, and — the killer feature — capture RGB / depth / semantic camera frames and stream them back to Claude as inline images, so the model can actually *see* what the simulated car sees.
+
+Built for AD ML engineers who want an LLM in the loop for scenario authoring, regression testing, and edge-case mining.
+
+## Status
+
+**v2.0 — 42 tools shipped**, covering the full AD ML loop:
+
+- World control, weather, spectator, traffic
+- All CARLA sensor types (RGB, depth, semantic, instance, optical flow, DVS, lidar, semantic lidar)
+- Sensor rigs (minimal / perception / full) + synchronized multi-sensor capture + KITTI-style dataset export
+- **3D analysis suite**: BEV lidar, semantic lidar, 3D point-cloud render, DBSCAN clustering, ground-plane RANSAC, voxelization, lidar→camera projection overlay, 3D-IoU
+- 3D bbox extraction → JSON / KITTI / nuScenes formats
+- BEV semantic raster, semantic vs ground-truth side-by-side
+- Recording + replay
+- Scenario compilation, scenario sweeps, adversarial prefabs (cut-in, sudden brake, jaywalker)
+- Failure-snapshot (auto frame on collision/lane-invasion)
+- HTTP transport for claude.ai Custom Connectors
+
+v2.5 / v3 roadmap in [ROADMAP.md](./ROADMAP.md).
+
+## Tools (42)
+
+### World & control
+| Tool | What it does |
+| --- | --- |
+| `world_status` | Map, weather, actor counts, sim time, list of tracked actor ids. |
+| `load_map(name)` | Switch town. Town01–07, Town10HD_Opt, Town11–15. **Destroys all actors.** |
+| `set_weather(preset, ...)` | Apply named preset or override cloudiness/precipitation/sun/fog/wetness. |
+| `set_spectator(actor_id?, x?,y?,z?, distance, height, pitch)` | Move the simulator's viewport — chase an actor or teleport. |
+| `wait(seconds)` | Let the sim run between actions. |
+| `reset_world()` | Destroy all actors spawned through this server (cross-session via persistent JSON). |
+
+### Actors & traffic
+| Tool | What it does |
+| --- | --- |
+| `spawn_vehicle(model, spawn_point_index?, autopilot?, follow_with_spectator?)` | Spawn one vehicle, optionally chase-camera follow. |
+| `spawn_traffic(n_vehicles, n_pedestrians)` | Populate the world with autopilot agents. |
+| `spawn_pedestrian(n, ai, max_speed)` | Walkers with optional AI controllers. |
+| `spawn_adversarial(behavior, target_actor_id?, distance_m)` | Prefabs: `cut_in`, `sudden_brake`, `jaywalker`. |
+| `set_actor_behavior(actor_id, autopilot?, ignore_traffic_lights_pct?, …)` | Per-actor Traffic Manager configuration. |
+| `list_traffic_lights` / `set_traffic_light(id, state, freeze)` | Read + override signal states. |
+
+### Sensors (single-shot)
+| Tool | What it does |
+| --- | --- |
+| `capture_sensor(actor_id, sensor, width, height, fov)` | RGB / depth / semantic / instance_segmentation / optical_flow / dvs camera → PNG. |
+| `capture_lidar(actor_id, channels, range_m, …)` | One lidar sweep → BEV intensity PNG. |
+| `capture_semantic_lidar(actor_id, …)` | Semantic-tagged sweep → BEV PNG with CityScapes colors. |
+
+### 3D analysis & ML data
+| Tool | What it does |
+| --- | --- |
+| `render_lidar_3d(actor_id, view, semantic)` | Matplotlib 3D scatter render of a sweep (`iso`/`bev`/`rear`/`side`). |
+| `point_cloud_clusters(actor_id, eps, min_samples)` | DBSCAN proposals → BEV PNG + cluster centroids/extents. |
+| `extract_3d_bboxes(observer_actor_id, max_distance, format)` | Ground-truth 3D bboxes in JSON / KITTI / nuScenes formats. |
+| `render_bev_segmentation(actor_id, range_m, resolution)` | Top-down semantic raster (drivable area + actors). |
+| `compare_seg_with_truth(actor_id, …)` | Side-by-side: front semantic camera ⟷ BEV ground-truth. |
+| `voxelize(actor_id, voxel_size, range_m, z_range)` | Lidar → sparse 3D occupancy grid. |
+| `ground_plane_segment(actor_id, distance_threshold, iterations)` | RANSAC plane fit, ground vs. obstacle BEV PNG. |
+| `lidar_to_camera_overlay(actor_id, width, height, fov)` | Pinhole-project lidar onto RGB, color by depth. |
+| `compute_lidar_stats(actor_id, …)` | Density / range / per-ring counts / uniformity ratio. |
+| `iou_3d(actor_a_id, actor_b_id)` | AABB 3D IoU between two actors. |
+| `export_point_cloud(actor_id, format, output_path?)` | Write to disk: `ply` / `pcd` / `npy` / `bin` (KITTI). |
+
+### Sensor rigs & datasets
+| Tool | What it does |
+| --- | --- |
+| `attach_sensor_rig(actor_id, preset)` | Attach `minimal` / `perception` / `full` rig in one call → `rig_id`. |
+| `export_calibration(rig_id, format)` | Per-sensor intrinsic + extrinsic, JSON or KITTI calib.txt. |
+| `render_sensor_montage(rig_id, max_cells)` | Capture all cameras in the rig, lay out as a grid PNG. |
+| `capture_synchronized(rig_id, n_frames, delta_seconds, output_dir?)` | Sync-mode capture, paired frames + manifest.json. |
+| `auto_label(observer_actor_id, format, output_path?)` | One-frame ground-truth labels (KITTI / nuScenes / JSON). |
+| `export_dataset(rig_id, n_frames, label_format, output_dir?)` | Full KITTI-style dataset folder (calib + image_2 + velodyne + label_2). |
+
+### Recording, scenarios, viz
+| Tool | What it does |
+| --- | --- |
+| `start_recorder(path, additional_data)` / `stop_recorder()` / `replay(path, …)` | CARLA's built-in `.log` recording. |
+| `compile_scenario(spec)` | Materialize a structured spec (map+weather+ego+traffic+adversarials+spectator+wait) by chaining tools. |
+| `scenario_sweep(base_spec, vary, capture_after_s)` | Run the same scenario with a parameter swept across a list of values; aggregates world_status per run. |
+| `failure_snapshot(actor_id, watch_seconds, sensor)` | Watch for collision / lane-invasion, return event log + frame at moment of impact. |
+| `run_openscenario(file, scenario_runner_root?)` | Run an OpenSCENARIO 1.x file via cloned `scenario_runner`. |
+| `render_topdown(focus_actor_id?, radius)` | Map + actors bird's-eye PNG. |
+| `render_trajectory(actor_id, duration_s, sample_hz, range_m)` | Sample pose for N seconds, plot path on top-down map. |
+
+## Install
+
+Requires CARLA 0.9.16 already installed. The server is a Python package that runs in CARLA's Python venv.
+
+```powershell
+# from a clone of this repo
+C:\Users\allas\CARLA_0.9.16\.venv\Scripts\python.exe -m pip install -e C:\Users\allas\carla-mcp
+```
+
+Verify:
+```powershell
+C:\Users\allas\CARLA_0.9.16\.venv\Scripts\python.exe -m carla_mcp
+```
+(Server runs on stdio; Ctrl+C to exit. It's meant to be launched by Claude, not run interactively.)
+
+## Wire to Claude
+
+### Claude Desktop
+
+Edit `%APPDATA%\Claude\claude_desktop_config.json` (see [`examples/claude_desktop_config.json`](./examples/claude_desktop_config.json)):
+
+```json
+{
+  "mcpServers": {
+    "carla": {
+      "command": "C:\\Users\\allas\\CARLA_0.9.16\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "carla_mcp"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. The `carla` server should appear in the tools panel.
+
+### Claude Code
+
+Drop [`examples/.mcp.json`](./examples/.mcp.json) into any project root, or merge into `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "carla": {
+      "command": "C:\\Users\\allas\\CARLA_0.9.16\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "carla_mcp"]
+    }
+  }
+}
+```
+
+### claude.ai Custom Connectors (remote, web + mobile)
+
+claude.ai's "Add custom connector" expects a public HTTPS URL. Since CARLA runs on your own machine, expose the MCP server through a tunnel:
+
+```powershell
+# 1) Pick a long random secret token (one-time, store somewhere safe)
+$env:CARLA_MCP_TOKEN = -join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+echo $env:CARLA_MCP_TOKEN   # save this value
+
+# 2) Start carla-mcp in HTTP mode
+C:\Users\allas\CARLA_0.9.16\.venv\Scripts\python.exe -m carla_mcp --transport http --port 8765
+```
+
+In a second terminal, start a quick tunnel (Cloudflare, no account needed):
+
+```powershell
+# install once: winget install --id Cloudflare.cloudflared
+cloudflared tunnel --url http://localhost:8765
+```
+
+Cloudflared prints a URL like `https://random-words-1234.trycloudflare.com`. In claude.ai → **Settings → Connectors → Add custom connector**:
+
+- **URL**: `https://random-words-1234.trycloudflare.com/mcp`
+- **Authentication**: Bearer token, value = the `CARLA_MCP_TOKEN` you generated
+
+Then chat from claude.ai (web or mobile) and the model can drive your local CARLA.
+
+**Security notes**
+
+- Without `CARLA_MCP_TOKEN`, the HTTP server is unauthenticated — anyone who guesses the tunnel URL can spawn vehicles in your sim.
+- A `trycloudflare.com` URL has decent entropy but is not a substitute for the token.
+- For production / shared use, terminate the tunnel with **Cloudflare Access** (free for ≤ 50 users) which adds a real OAuth gate at the edge.
+- Stop the tunnel + `carla-mcp` process when you're done.
+
+## Usage example
+
+With CARLA simulator running (double-click "CARLA Simulator" desktop shortcut), ask Claude:
+
+> Load Town03, set the weather to HardRainNoon, spawn a Tesla and 20 traffic vehicles, wait 3 seconds, then show me what the Tesla sees from the front camera.
+
+Claude will chain `load_map → set_weather → spawn_vehicle → spawn_traffic → wait → capture_sensor` and the rendered RGB frame will appear directly in the chat.
+
+## Configuration
+
+Environment variables read at server start:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CARLA_HOST` | `localhost` | Host running the CARLA simulator. |
+| `CARLA_PORT` | `2000` | CARLA RPC port. |
+| `CARLA_TIMEOUT` | `10.0` | Client connect timeout (seconds). |
+| `CARLA_MCP_TRANSPORT` | `stdio` | `stdio` or `http`. |
+| `CARLA_MCP_HTTP_HOST` | `127.0.0.1` | Bind addr in HTTP mode (use `0.0.0.0` to expose). |
+| `CARLA_MCP_HTTP_PORT` | `8765` | HTTP port. |
+| `CARLA_MCP_TOKEN` | *(empty)* | Bearer token required in HTTP mode. Empty = no auth. |
+| `CARLA_MCP_LOG` | `%TEMP%/carla-mcp.log` | Path where libcarla's native stdout is redirected in stdio mode (so its `INFO: …` lines don't corrupt the MCP JSON-RPC stream). Tail this file to debug. |
+
+Same flags are also accepted on the command line: `--transport`, `--host`, `--port`.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).

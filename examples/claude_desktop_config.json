@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "carla": {
+      "command": "C:\\Users\\allas\\CARLA_0.9.16\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "carla_mcp"],
+      "env": {
+        "CARLA_HOST": "localhost",
+        "CARLA_PORT": "2000"
+      }
+    }
+  }
+}
