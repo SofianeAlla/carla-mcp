@@ -190,13 +190,39 @@ Then chat from claude.ai (web or mobile) and the model can drive your local CARL
 - For production / shared use, terminate the tunnel with **Cloudflare Access** (free for ≤ 50 users) which adds a real OAuth gate at the edge.
 - Stop the tunnel + `carla-mcp` process when you're done.
 
-## Usage example
+## Usage examples
 
-With CARLA simulator running (double-click "CARLA Simulator" desktop shortcut), ask Claude:
+With CARLA simulator running (double-click "CARLA Simulator" desktop shortcut), ask Claude.
+
+### Quick smoke test
 
 > Load Town03, set the weather to HardRainNoon, spawn a Tesla and 20 traffic vehicles, wait 3 seconds, then show me what the Tesla sees from the front camera.
 
-Claude will chain `load_map → set_weather → spawn_vehicle → spawn_traffic → wait → capture_sensor` and the rendered RGB frame will appear directly in the chat.
+Claude chains `load_map → set_weather → spawn_vehicle → spawn_traffic → wait → capture_sensor` and the rendered RGB frame appears inline.
+
+### End-to-end perception eval (the demo run)
+
+Paste this into a fresh chat. Produces ~6 inline images plus a KITTI label dump and an engineer-eye-view summary in roughly 60 seconds of execution.
+
+> Set up an end-to-end perception eval in CARLA. Use the carla tools and chain them — don't ask me between steps:
+>
+> 1. Probe `world_status` to confirm the simulator is reachable. If not on `Town10HD_Opt`, call `load_map("Town10HD_Opt")`; otherwise skip the reload (avoids the cold-start `load_world()` cost on heavy maps).
+> 2. Set weather to `MidRainSunset`.
+> 3. **Populate the world first**: 25 traffic vehicles + 8 pedestrians, so the ego spawns into a live scene rather than empty streets.
+> 4. Wait 3 seconds for traffic to disperse onto the network.
+> 5. **Now spawn the ego**: a Tesla Model 3 with autopilot and `follow_with_spectator=True`. Keep its `actor_id`. The simulator window's spectator camera will continuously chase the moving Tesla (v2.1.2+).
+> 6. Wait another 2 seconds so the chase shot beds in.
+> 7. Front camera RGB, then `compare_seg_with_truth` for the semantic ⟷ BEV ground-truth side-by-side.
+> 8. Lidar perception: `render_lidar_3d` with `view="iso"`, then a BEV semantic raster via `capture_semantic_lidar`.
+> 9. `compute_lidar_stats` and report point count, max range, and ring uniformity.
+> 10. `extract_3d_bboxes` in KITTI format with `max_distance=80`. Show me the first 3 lines.
+> 11. Spawn an adversarial cut-in 15m ahead of the ego. Wait 3 seconds.
+> 12. Capture the front camera at the moment of the swerve — that's our "interesting frame".
+> 13. Reset the world.
+>
+> After step 12, summarize in one paragraph what an AD perception engineer would learn from this run.
+
+For a different visual flavor, swap step 1 for `Town04` + `HardRainNoon` (highway loop, faster cut-in dynamics) or `Town07` + `CloudySunset` (rural countryside, vegetation-dominated BEV).
 
 ## Configuration
 
