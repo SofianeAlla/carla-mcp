@@ -127,8 +127,26 @@ def _get_client() -> carla.Client:
     return _client
 
 
+def _reset_client() -> None:
+    """Drop the cached carla.Client. Next _get_client() call will rebuild."""
+    global _client
+    _client = None
+
+
 def _world() -> carla.World:
-    return _get_client().get_world()
+    """Return the live world, transparently rebuilding the client if stale.
+
+    The cached carla.Client persists across MCP tool calls within a subprocess.
+    If the simulator gets restarted (manual launch, stop_simulator + start_simulator,
+    or a hang recovery), the cached client points at the old process and every
+    RPC times out. Catching the timeout once and rebuilding gives us
+    self-healing across sim restarts.
+    """
+    try:
+        return _get_client().get_world()
+    except RuntimeError:
+        _reset_client()
+        return _get_client().get_world()
 
 
 def _load_tracked() -> set[int]:
@@ -475,16 +493,27 @@ def start_simulator(
             First-ever launch on a cold cache can take 3–5 minutes for shader
             compilation; bump to 300 if you see timeouts on the first run.
     """
-    # Already up? Don't double-launch.
-    if _port_listening(_CARLA_HOST, _CARLA_PORT):
-        existing = _carla_processes_alive()
-        return {
-            "started": False,
-            "already_running": True,
-            "process_pids": existing,
-            "port": f"{_CARLA_HOST}:{_CARLA_PORT}",
-            "wait_seconds": 0.0,
-        }
+    # Already up? Don't double-launch. Require BOTH a live CarlaUE4* process
+    # AND port 2000 listening — Windows TIME_WAIT after a recent stop_simulator
+    # can leave the port "open" for ~60s with no actual server behind it,
+    # which previously made start_simulator short-circuit incorrectly.
+    existing = _carla_processes_alive()
+    if existing and _port_listening(_CARLA_HOST, _CARLA_PORT):
+        # Sanity-check with a real RPC ping before declaring ready.
+        try:
+            probe = carla.Client(_CARLA_HOST, _CARLA_PORT)
+            probe.set_timeout(3.0)
+            _ = probe.get_server_version()
+            return {
+                "started": False,
+                "already_running": True,
+                "process_pids": existing,
+                "port": f"{_CARLA_HOST}:{_CARLA_PORT}",
+                "wait_seconds": 0.0,
+            }
+        except Exception:
+            # Process + port are there but RPC is wedged. Don't claim ready.
+            pass
 
     root_str = (
         carla_root
@@ -533,17 +562,33 @@ def start_simulator(
 
     t0 = time.time()
     deadline = t0 + max(5.0, float(wait_ready_seconds))
+    port_ready_at: float | None = None
     while time.time() < deadline:
-        if _port_listening(_CARLA_HOST, _CARLA_PORT, timeout=1.0):
-            return {
-                "started": True,
-                "already_running": False,
-                "pid": proc.pid,
-                "executable": str(exe),
-                "args": args[1:],
-                "port": f"{_CARLA_HOST}:{_CARLA_PORT}",
-                "wait_seconds": round(time.time() - t0, 1),
-            }
+        # Stage 1: TCP port accepts connections
+        if port_ready_at is None and _port_listening(_CARLA_HOST, _CARLA_PORT, timeout=1.0):
+            port_ready_at = time.time()
+        # Stage 2: actual RPC works (UE4 finished loading the world).
+        # Probe with a fresh, short-timeout client so we don't poison the
+        # cached one with our retries.
+        if port_ready_at is not None:
+            try:
+                probe = carla.Client(_CARLA_HOST, _CARLA_PORT)
+                probe.set_timeout(3.0)
+                _ = probe.get_server_version()
+                # RPC is alive — drop any stale cached client and return.
+                _reset_client()
+                return {
+                    "started": True,
+                    "already_running": False,
+                    "pid": proc.pid,
+                    "executable": str(exe),
+                    "args": args[1:],
+                    "port": f"{_CARLA_HOST}:{_CARLA_PORT}",
+                    "wait_seconds": round(time.time() - t0, 1),
+                    "port_open_after_s": round(port_ready_at - t0, 1),
+                }
+            except Exception:
+                pass  # Still loading — keep polling.
         # If the process died early, surface that
         if proc.poll() is not None:
             raise RuntimeError(
@@ -553,9 +598,9 @@ def start_simulator(
         time.sleep(1.0)
 
     raise RuntimeError(
-        f"Simulator started (PID {proc.pid}) but port {_CARLA_PORT} did not "
-        f"open within {wait_ready_seconds}s. First launches need 3–5 min for "
-        f"shader compilation — retry with `wait_ready_seconds=300`."
+        f"Simulator started (PID {proc.pid}) but the RPC handler was not ready "
+        f"within {wait_ready_seconds}s. First launches need 3–5 min for shader "
+        f"compilation — retry with `wait_ready_seconds=300`."
     )
 
 
@@ -568,22 +613,30 @@ def stop_simulator() -> dict[str, Any]:
     """
     killed: list[str] = []
     if platform.system() == "Windows":
+        # Use returncode (locale-independent) instead of parsing the
+        # localized "SUCCESS:" string — taskkill prints "RÉUSSI" on French
+        # Windows, "ERFOLGREICH" on German, etc., which broke the match.
         for name in ("CarlaUE4-Win64-Shipping.exe", "CarlaUE4.exe"):
             try:
                 out = subprocess.run(
                     ["taskkill", "/F", "/IM", name],
                     capture_output=True, text=True, timeout=10,
                 )
-                if "SUCCESS" in (out.stdout or "").upper():
+                if out.returncode == 0:
                     killed.append(name)
             except Exception:
                 pass
     else:
         try:
-            subprocess.run(["pkill", "-9", "-f", "CarlaUE4"], timeout=10, check=False)
-            killed.append("CarlaUE4*")
+            out = subprocess.run(
+                ["pkill", "-9", "-f", "CarlaUE4"], timeout=10, check=False,
+            )
+            if out.returncode in (0, 1):  # 0 = killed, 1 = nothing matched
+                killed.append("CarlaUE4*")
         except Exception:
             pass
+    # Drop the cached client — its connection points at the dead process.
+    _reset_client()
     # Give the OS a moment to release the port
     time.sleep(0.5)
     return {

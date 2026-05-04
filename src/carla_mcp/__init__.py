@@ -1,4 +1,4 @@
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 # In stdio MCP mode, libcarla's C++ side prints lines like
 #     INFO:  Found the required file in cache!  Carla/Maps/Nav/Town03.bin
