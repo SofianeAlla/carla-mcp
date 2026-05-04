@@ -34,7 +34,7 @@ mcp = FastMCP("carla-mcp")
 
 _CARLA_HOST = os.environ.get("CARLA_HOST", "localhost")
 _CARLA_PORT = int(os.environ.get("CARLA_PORT", "2000"))
-_CARLA_TIMEOUT = float(os.environ.get("CARLA_TIMEOUT", "10.0"))
+_CARLA_TIMEOUT = float(os.environ.get("CARLA_TIMEOUT", "20.0"))
 
 _client: carla.Client | None = None
 _TRACKED_FILE = Path(tempfile.gettempdir()) / "carla-mcp-tracked.json"
