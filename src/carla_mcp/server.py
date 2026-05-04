@@ -301,18 +301,69 @@ def _bev_from_points(
     return img
 
 
-def _follow_with_spectator(actor: carla.Actor, distance: float = 8.0, height: float = 4.0, pitch: float = -15.0) -> None:
+# Continuous-chase state. CARLA's on_tick callback fires each simulator
+# tick (~10–60 Hz depending on settings); we register a closure that pulls
+# the followed actor's transform and reposes the spectator.
+_FOLLOW_CALLBACK_ID: int | None = None
+_FOLLOW_ACTOR_ID: int | None = None
+
+
+def _stop_follow() -> None:
+    """Cancel any active continuous-chase callback."""
+    global _FOLLOW_CALLBACK_ID, _FOLLOW_ACTOR_ID
+    if _FOLLOW_CALLBACK_ID is not None:
+        try:
+            _world().remove_on_tick(_FOLLOW_CALLBACK_ID)
+        except Exception:
+            pass
+    _FOLLOW_CALLBACK_ID = None
+    _FOLLOW_ACTOR_ID = None
+
+
+def _start_follow(actor_id: int, distance: float = 8.0, height: float = 4.0, pitch: float = -15.0) -> None:
+    """Register an on_tick callback that pins the spectator behind an actor.
+
+    Replaces any previous follow target. Auto-cancels if the actor disappears
+    so a stale callback never crashes CARLA after a reset.
+    """
+    global _FOLLOW_CALLBACK_ID, _FOLLOW_ACTOR_ID
+    _stop_follow()
     w = _world()
-    t = actor.get_transform()
-    forward = t.get_forward_vector()
-    loc = carla.Location(
-        x=t.location.x - forward.x * distance,
-        y=t.location.y - forward.y * distance,
-        z=t.location.z + height,
-    )
-    w.get_spectator().set_transform(
-        carla.Transform(loc, carla.Rotation(pitch=pitch, yaw=t.rotation.yaw))
-    )
+    spectator = w.get_spectator()
+    captured_id = int(actor_id)
+    captured = (float(distance), float(height), float(pitch))
+
+    def _cb(_snapshot: Any) -> None:
+        d, h, p = captured
+        actor = w.get_actor(captured_id)
+        if actor is None or not actor.is_alive:
+            _stop_follow()
+            return
+        try:
+            t = actor.get_transform()
+            fwd = t.get_forward_vector()
+            spectator.set_transform(
+                carla.Transform(
+                    carla.Location(
+                        x=t.location.x - fwd.x * d,
+                        y=t.location.y - fwd.y * d,
+                        z=t.location.z + h,
+                    ),
+                    carla.Rotation(pitch=p, yaw=t.rotation.yaw),
+                )
+            )
+        except Exception:
+            # If something fails inside the tick (actor mid-destroy etc.),
+            # bail quietly rather than spam errors.
+            pass
+
+    _FOLLOW_CALLBACK_ID = w.on_tick(_cb)
+    _FOLLOW_ACTOR_ID = captured_id
+
+
+def _follow_with_spectator(actor: carla.Actor, distance: float = 8.0, height: float = 4.0, pitch: float = -15.0) -> None:
+    """Pin the spectator continuously behind an actor (on_tick callback)."""
+    _start_follow(actor.id, distance=distance, height=height, pitch=pitch)
 
 
 WEATHER_PRESETS = {
@@ -524,16 +575,21 @@ def set_spectator(
         actor = w.get_actor(actor_id)
         if actor is None:
             raise ValueError(f"Actor {actor_id} not found.")
-        _follow_with_spectator(actor, distance=distance, height=height, pitch=pitch)
+        _start_follow(actor_id, distance=distance, height=height, pitch=pitch)
         loc = actor.get_transform().location
-        return {"following_actor": actor_id, "actor_location": [loc.x, loc.y, loc.z]}
+        return {"following_actor": actor_id, "actor_location": [loc.x, loc.y, loc.z],
+                "mode": "continuous"}
     if x is not None and y is not None and z is not None:
+        # Teleport cancels any active follow.
+        _stop_follow()
         loc = carla.Location(x=float(x), y=float(y), z=float(z))
         spectator.set_transform(
             carla.Transform(loc, carla.Rotation(pitch=float(pitch), yaw=0.0))
         )
-        return {"teleported_to": [x, y, z]}
-    raise ValueError("Provide actor_id (to follow) or x, y, z (to teleport).")
+        return {"teleported_to": [x, y, z], "mode": "static"}
+    # No args: just stop following.
+    _stop_follow()
+    return {"mode": "stopped_following"}
 
 
 @mcp.tool()
@@ -815,6 +871,9 @@ def reset_world(also_clear_tracked: bool = True) -> dict[str, Any]:
     destroyed = 0
     failed = 0
     tracked = _load_tracked()
+    # Stop any continuous chase-cam first — the followed actor is likely about
+    # to be destroyed and we don't want a stale on_tick callback chasing it.
+    _stop_follow()
     if also_clear_tracked:
         for aid in list(tracked):
             actor = w.get_actor(aid)
@@ -1361,18 +1420,25 @@ def compare_seg_with_truth(actor_id: int, width: int = 800, height: int = 600) -
     """
     sem = capture_sensor(actor_id=actor_id, sensor="semantic", width=width, height=height)
     bev = render_bev_segmentation(actor_id=actor_id)
-    # decode both PNGs and stitch horizontally
     left = np.array(PILImage.open(io.BytesIO(sem.data)).convert("RGB"))
     right = np.array(PILImage.open(io.BytesIO(bev.data)).convert("RGB"))
-    # match heights
     target_h = max(left.shape[0], right.shape[0])
-    def _pad_to_h(img: np.ndarray, h: int) -> np.ndarray:
+
+    # Pad with the CityScapes "unlabeled" color (black-ish) on the left pane
+    # but with the BEV's own background on the right pane — matplotlib's BEV
+    # has a transparent unlabeled background that came through as black, which
+    # made the left-vs-right split look broken. Sample the right pane's
+    # corner color and pad with that to keep the boundary clean.
+    def _pad(img: np.ndarray, h: int, fill: tuple[int, int, int]) -> np.ndarray:
         if img.shape[0] == h:
             return img
-        pad = np.zeros((h - img.shape[0], img.shape[1], 3), dtype=np.uint8)
+        pad = np.full((h - img.shape[0], img.shape[1], 3), fill, dtype=np.uint8)
         return np.vstack([img, pad])
-    left = _pad_to_h(left, target_h)
-    right = _pad_to_h(right, target_h)
+
+    left_fill = tuple(left[-1, 0])
+    right_fill = tuple(right[-1, 0])
+    left = _pad(left, target_h, left_fill)
+    right = _pad(right, target_h, right_fill)
     montage = np.hstack([left, right])
     return _png(montage)
 
@@ -1484,7 +1550,20 @@ def compute_lidar_stats(
     if not len(xyz):
         return {"n_points": 0}
 
-    ranges = np.linalg.norm(xyz[:, :2], axis=1)
+    # Filter inf / nan early. Heavy rain in CARLA can produce raycasts that
+    # never hit anything; their range comes through as inf and poisons every
+    # downstream percentile to NaN. Clip to a sane upper bound (range_m * 2)
+    # so we keep the realistic returns without polluting stats.
+    finite = np.isfinite(xyz).all(axis=1)
+    xyz = xyz[finite]
+    if not len(xyz):
+        return {"n_points": 0, "note": "all returns were non-finite (rain artifact)"}
+    ranges = np.linalg.norm(xyz[:, :2].astype(np.float64), axis=1)
+    sane = np.isfinite(ranges) & (ranges < range_m * 2.0)
+    xyz = xyz[sane]
+    ranges = ranges[sane]
+    if not len(xyz):
+        return {"n_points": 0, "note": "no points within sane range"}
     z = xyz[:, 2]
 
     # Approximate ring index by elevation angle bucket (assumes vertical fov split into channels)
