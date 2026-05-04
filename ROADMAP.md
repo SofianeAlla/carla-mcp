@@ -92,7 +92,19 @@ v1 (current) is the smallest surface that makes Claude useful inside CARLA. v2 b
 - [ ] `generate_opendrive(spec)` — programmatic road network creation
 - [ ] `import_osm(extract)` — convert OpenStreetMap regions to drivable maps
 
-## v0.5–2.0 — shipped (this release)
+## v2.1 — shipped (3D perception eval)
+
+Seven new tools that turn carla-mcp into a real perception-evaluation harness, using fields the semantic-lidar sensor already provides (per-point `ObjIdx` + `ObjTag`):
+
+- `extract_actor_points(observer, target_actor)` — slice points by actor instance id; per-object centroid/extent/dominant class
+- `actor_visibility(observer, target?)` — per-actor lidar hit counts + `high`/`medium`/`low`/`occluded` classification
+- `class_conditional_bev(observer, classes)` — BEV filtered to specific semantic classes
+- `evaluate_clustering(observer, eps, min_samples, iou_threshold)` — DBSCAN-vs-ground-truth precision / recall / mean IoU + BEV PNG (matched green, FP red, missed orange)
+- `lidar_to_camera_segmentation(observer)` — project semantic lidar onto RGB, color each point by class
+- `check_sensor_consistency(observer)` — semantic camera vs semantic lidar pixel agreement %
+- `semantic_voxelize(observer, voxel_size, classes?)` — voxelize with dominant class per voxel (OccNet ground truth)
+
+## v0.5–2.0 — shipped
 
 A consolidated v2.0 release; **42 tools** total. Categories:
 

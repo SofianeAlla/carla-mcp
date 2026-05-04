@@ -1,14 +1,22 @@
 # carla-mcp
 
-> MCP connector that gives Claude **eyes and hands** inside the [CARLA](https://carla.org) autonomous-driving simulator.
+> The **3D-simulation-and-analysis** MCP connector for [CARLA](https://carla.org).
+> Strongly biased toward **lidar, point clouds, semantic segmentation, and perception evaluation** — not just camera screenshots.
 
-A FastMCP server exposing CARLA's Python API as Claude tools: load maps, spawn vehicles and traffic, control weather, and — the killer feature — capture RGB / depth / semantic camera frames and stream them back to Claude as inline images, so the model can actually *see* what the simulated car sees.
+A FastMCP server giving Claude eyes-and-hands control of the CARLA autonomous-driving simulator, with a dedicated 3D suite that no other MCP connector ships:
 
-Built for AD ML engineers who want an LLM in the loop for scenario authoring, regression testing, and edge-case mining.
+- **3D point-cloud capture** — lidar BEV, semantic lidar, headless 3D scatter renders (iso / bev / rear / side views).
+- **3D analysis** — DBSCAN object proposals, RANSAC ground-plane fit, voxelization (geometric **and** semantic), 3D-IoU between actors, lidar→camera projection (depth- or class-coloured), per-actor visibility audits.
+- **Perception evaluation, no model needed** — `evaluate_clustering` matches DBSCAN proposals against CARLA's ground-truth `ObjIdx` and reports precision / recall / mean IoU. `check_sensor_consistency` cross-validates semantic camera vs semantic lidar pixel-by-pixel.
+- **3D dataset export** — sensor rigs (front/rear/L/R cams + 64-ch semantic lidar + IMU/GNSS/radar), synchronized capture, KITTI-style packaged dataset folder, point-cloud export to PLY / PCD / NPY / KITTI BIN.
+
+Camera tools (RGB / depth / semantic / instance / optical-flow / DVS) are still here, but they're support-cast for the 3D pipeline — not the headline.
+
+Built for AD ML / perception engineers who want an LLM in the loop for scenario authoring, regression testing, lidar / segmentation evaluation, and edge-case mining.
 
 ## Status
 
-**v2.0 — 42 tools shipped**, covering the full AD ML loop:
+**v2.1 — 49 tools shipped**, with a dedicated 3D / perception-eval suite. Covers the full AD ML loop:
 
 - World control, weather, spectator, traffic
 - All CARLA sensor types (RGB, depth, semantic, instance, optical flow, DVS, lidar, semantic lidar)
@@ -23,7 +31,7 @@ Built for AD ML engineers who want an LLM in the loop for scenario authoring, re
 
 v2.5 / v3 roadmap in [ROADMAP.md](./ROADMAP.md).
 
-## Tools (42)
+## Tools (49)
 
 ### World & control
 | Tool | What it does |
@@ -52,7 +60,7 @@ v2.5 / v3 roadmap in [ROADMAP.md](./ROADMAP.md).
 | `capture_lidar(actor_id, channels, range_m, …)` | One lidar sweep → BEV intensity PNG. |
 | `capture_semantic_lidar(actor_id, …)` | Semantic-tagged sweep → BEV PNG with CityScapes colors. |
 
-### 3D analysis & ML data
+### 3D analysis & ML data — the headline suite
 | Tool | What it does |
 | --- | --- |
 | `render_lidar_3d(actor_id, view, semantic)` | Matplotlib 3D scatter render of a sweep (`iso`/`bev`/`rear`/`side`). |
@@ -66,6 +74,17 @@ v2.5 / v3 roadmap in [ROADMAP.md](./ROADMAP.md).
 | `compute_lidar_stats(actor_id, …)` | Density / range / per-ring counts / uniformity ratio. |
 | `iou_3d(actor_a_id, actor_b_id)` | AABB 3D IoU between two actors. |
 | `export_point_cloud(actor_id, format, output_path?)` | Write to disk: `ply` / `pcd` / `npy` / `bin` (KITTI). |
+
+### 3D perception evaluation (v2.1) — uses semantic-lidar's `ObjIdx`
+| Tool | What it does |
+| --- | --- |
+| `extract_actor_points(observer_actor_id, target_actor_id, …)` | Slice a sweep to one actor's points (count, centroid, extent, dominant class, BEV PNG). Foundation for instance-level analyses. |
+| `actor_visibility(observer_actor_id, target_actor_id?)` | Per-actor lidar hit count + visibility class (`high`/`medium`/`low`/`occluded`). Filter for autolabel quality. |
+| `class_conditional_bev(observer_actor_id, classes)` | BEV showing only specified classes (e.g. `["Car","Pedestrian"]` for dynamic-actor map). |
+| `evaluate_clustering(observer_actor_id, eps, min_samples, iou_threshold)` | DBSCAN proposals matched against ground-truth `ObjIdx` → precision, recall, mean IoU, per-actor matches, BEV PNG (matched green / FP red / missed orange). **Real ML evaluation, no detector model needed.** |
+| `lidar_to_camera_segmentation(observer_actor_id, …)` | Project semantic lidar into RGB camera, color each projected point by class. Sparse pixel-perfect semantic GT from sensor calibration alone. |
+| `check_sensor_consistency(observer_actor_id, …)` | Capture semantic camera + project semantic lidar into it. Per-class agreement %, plus overlay PNG with disagreements highlighted red. |
+| `semantic_voxelize(observer_actor_id, voxel_size, classes?)` | Voxelize but each occupied voxel keeps its dominant class. Direct ground truth for OccNet / BEVFusion. |
 
 ### Sensor rigs & datasets
 | Tool | What it does |

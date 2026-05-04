@@ -316,8 +316,79 @@ def t45():
     return S.compile_scenario(spec)
 
 
-@step("46 reset_world")
+# --- v2.1: 3D perception evaluation suite ---
+
+@step("46 actor_visibility (all)")
 def t46():
+    out = S.actor_visibility(observer_actor_id=state["ego_id"],
+                             channels=32, range_m=60.0, points_per_second=200_000)
+    if out["actors"]:
+        state["nearby_actor"] = out["actors"][0]["actor_id"]
+    return {"n_actors_visible": out["n_actors_visible"]}
+
+
+@step("47 actor_visibility (target=ego)")
+def t47():
+    return S.actor_visibility(observer_actor_id=state["ego_id"],
+                              target_actor_id=state["ego_id"],
+                              channels=32, range_m=60.0, points_per_second=200_000)
+
+
+@step("48 extract_actor_points")
+def t48():
+    target = state.get("nearby_actor", state["ego_id"])
+    out = S.extract_actor_points(observer_actor_id=state["ego_id"], target_actor_id=target,
+                                 channels=32, range_m=60.0, points_per_second=200_000)
+    return {k: v for k, v in out.items() if k != "image"}
+
+
+@step("49 class_conditional_bev Car+Pedestrian")
+def t49():
+    return S.class_conditional_bev(observer_actor_id=state["ego_id"],
+                                   classes=["Car", "Pedestrian"],
+                                   channels=32, range_m=60.0, points_per_second=200_000)
+
+
+@step("50 evaluate_clustering")
+def t50():
+    out = S.evaluate_clustering(observer_actor_id=state["ego_id"],
+                                eps=0.7, min_samples=5, iou_threshold=0.2,
+                                channels=32, range_m=60.0, points_per_second=200_000)
+    return {k: v for k, v in out.items() if k != "image"}
+
+
+@step("51 lidar_to_camera_segmentation")
+def t51():
+    return S.lidar_to_camera_segmentation(observer_actor_id=state["ego_id"],
+                                          width=640, height=360,
+                                          channels=32, range_m=60.0, points_per_second=200_000)
+
+
+@step("52 check_sensor_consistency")
+def t52():
+    out = S.check_sensor_consistency(observer_actor_id=state["ego_id"],
+                                     width=640, height=360,
+                                     channels=32, range_m=60.0, points_per_second=200_000)
+    return {k: v for k, v in out.items() if k != "image"}
+
+
+@step("53 semantic_voxelize all classes")
+def t53():
+    out = S.semantic_voxelize(observer_actor_id=state["ego_id"], voxel_size=0.5,
+                              range_m=40.0, channels=32, points_per_second=200_000)
+    return {k: v for k, v in out.items() if k != "occupied_voxels_truncated"}
+
+
+@step("54 semantic_voxelize Car only")
+def t54():
+    out = S.semantic_voxelize(observer_actor_id=state["ego_id"], voxel_size=0.5,
+                              range_m=40.0, classes=["Car"],
+                              channels=32, points_per_second=200_000)
+    return {k: v for k, v in out.items() if k != "occupied_voxels_truncated"}
+
+
+@step("55 reset_world")
+def t55():
     return S.reset_world(also_clear_tracked=True)
 
 
@@ -327,7 +398,8 @@ ALL = [
     t11, t12, t13, t14, t15, t16, t17, t18, t19, t20,
     t21, t22, t23, t24, t25, t26, t27, t28, t29, t30,
     t31, t32, t33, t34, t35, t36, t37, t38, t39, t40,
-    t41, t42, t43, t44, t45, t46,
+    t41, t42, t43, t44, t45,
+    t46, t47, t48, t49, t50, t51, t52, t53, t54, t55,
 ]
 
 if __name__ == "__main__":

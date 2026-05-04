@@ -88,6 +88,34 @@ _KITTI_CLASS = {
 }
 
 
+# CARLA semantic class id → human-readable name (29 classes in 0.9.16).
+# Index matches CITYSCAPES_PALETTE.
+SEMANTIC_NAMES = [
+    "Unlabeled", "Road", "Sidewalk", "Building", "Wall", "Fence", "Pole",
+    "TrafficLight", "TrafficSign", "Vegetation", "Terrain", "Sky",
+    "Pedestrian", "Rider", "Car", "Truck", "Bus", "Train", "Motorcycle",
+    "Bicycle", "Static", "Dynamic", "Other", "Water", "RoadLine", "Ground",
+    "Bridge", "RailTrack", "GuardRail",
+]
+_NAME_TO_TAG = {n.lower(): i for i, n in enumerate(SEMANTIC_NAMES)}
+
+
+def _resolve_class_filter(classes: list[str] | None) -> set[int] | None:
+    """Convert a list of class names (case-insensitive) to a set of CARLA tag ids.
+    Unknown names raise ValueError. None means no filter (keep all classes)."""
+    if classes is None:
+        return None
+    out: set[int] = set()
+    for c in classes:
+        key = c.strip().lower()
+        if key not in _NAME_TO_TAG:
+            raise ValueError(
+                f"Unknown semantic class {c!r}. Valid names: {SEMANTIC_NAMES}"
+            )
+        out.add(_NAME_TO_TAG[key])
+    return out
+
+
 def _get_client() -> carla.Client:
     global _client
     if _client is None:
@@ -194,11 +222,12 @@ def _capture_one_lidar(
     rotation_freq: float = 10.0,
     upper_fov: float = 10.0,
     lower_fov: float = -30.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Capture one lidar sweep. Returns (points_xyz_intensity, classes_or_intensity).
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Capture one lidar sweep. Returns a 3-tuple (points, tags, obj_idx).
 
-    For non-semantic lidar: shape (N, 4) = x,y,z,intensity; classes is None.
-    For semantic lidar:    shape (N, 3) = x,y,z;            classes is (N,) uint32 tags.
+    Non-semantic:  (N,4) points (x,y,z,intensity), tags=None, obj_idx=None.
+    Semantic:      (N,3) points (x,y,z),           tags=(N,) uint32 class ids,
+                                                    obj_idx=(N,) uint32 instance ids.
     """
     w = _world()
     bp_id = "sensor.lidar.ray_cast_semantic" if semantic else "sensor.lidar.ray_cast"
@@ -229,10 +258,11 @@ def _capture_one_lidar(
             )
             xyz = np.stack([data["x"], data["y"], data["z"]], axis=1)
             tags = data["ObjTag"].astype(np.uint32)
-            return xyz, tags
+            obj_idx = data["ObjIdx"].astype(np.uint32)
+            return xyz, tags, obj_idx
         else:
             data = np.frombuffer(last.raw_data, dtype=np.float32).reshape(-1, 4)
-            return data, None  # type: ignore[return-value]
+            return data, None, None
     finally:
         lidar.stop()
         lidar.destroy()
@@ -999,7 +1029,7 @@ def capture_lidar(
     parent = _world().get_actor(actor_id)
     if parent is None:
         raise ValueError(f"Actor {actor_id} not found.")
-    pts, _ = _capture_one_lidar(
+    pts, _, _ = _capture_one_lidar(
         parent, semantic=False, channels=channels, range_m=range_m,
         pps=points_per_second, rotation_freq=rotation_freq,
     )
@@ -1022,7 +1052,7 @@ def capture_semantic_lidar(
     parent = _world().get_actor(actor_id)
     if parent is None:
         raise ValueError(f"Actor {actor_id} not found.")
-    xyz, tags = _capture_one_lidar(
+    xyz, tags, _ = _capture_one_lidar(
         parent, semantic=True, channels=channels, range_m=range_m,
         pps=points_per_second, rotation_freq=rotation_freq,
     )
@@ -1057,11 +1087,11 @@ def render_lidar_3d(
         raise ValueError(f"Actor {actor_id} not found.")
 
     if semantic:
-        xyz, tags = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
+        xyz, tags, _ = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
         tags_clipped = np.clip(tags, 0, len(CITYSCAPES_PALETTE) - 1)
         colors = CITYSCAPES_PALETTE[tags_clipped] / 255.0
     else:
-        pts, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
+        pts, _, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
         xyz = pts[:, :3]
         inten = pts[:, 3]
         inten = np.clip(inten / max(1e-6, inten.max()), 0, 1)
@@ -1116,7 +1146,7 @@ def point_cloud_clusters(
     parent = _world().get_actor(actor_id)
     if parent is None:
         raise ValueError(f"Actor {actor_id} not found.")
-    pts, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
+    pts, _, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
     xyz = pts[:, :3]
     # Drop ground returns (rough heuristic: z < -1.5 is ground from a 2.5m sensor)
     above_ground = xyz[:, 2] > -1.4
@@ -1376,12 +1406,12 @@ def export_point_cloud(
         raise ValueError(f"Actor {actor_id} not found.")
 
     if semantic:
-        xyz, tags = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
+        xyz, tags, _ = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
         intensities = np.zeros(len(xyz), dtype=np.float32)
         pts4 = np.hstack([xyz.astype(np.float32),
                           intensities.reshape(-1, 1)])
     else:
-        pts4, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
+        pts4, _, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
         tags = None
 
     out = Path(output_path) if output_path else (
@@ -1449,7 +1479,7 @@ def compute_lidar_stats(
     parent = _world().get_actor(actor_id)
     if parent is None:
         raise ValueError(f"Actor {actor_id} not found.")
-    pts, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
+    pts, _, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
     xyz = pts[:, :3]
     if not len(xyz):
         return {"n_points": 0}
@@ -1497,7 +1527,7 @@ def voxelize(
     parent = _world().get_actor(actor_id)
     if parent is None:
         raise ValueError(f"Actor {actor_id} not found.")
-    pts, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
+    pts, _, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
     xyz = pts[:, :3]
 
     z_lo, z_hi = (z_range or [-2.0, 4.0])
@@ -1555,7 +1585,7 @@ def ground_plane_segment(
     parent = _world().get_actor(actor_id)
     if parent is None:
         raise ValueError(f"Actor {actor_id} not found.")
-    pts, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
+    pts, _, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
     xyz = pts[:, :3]
     if len(xyz) < 100:
         raise RuntimeError("Too few points for RANSAC fit.")
@@ -1622,7 +1652,7 @@ def lidar_to_camera_overlay(
         parent, "sensor.camera.rgb", carla.ColorConverter.Raw,
         width, height, fov, carla.Transform(carla.Location(x=1.6, z=1.7)),
     )
-    pts, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
+    pts, _, _ = _capture_one_lidar(parent, False, channels, range_m, points_per_second)
     xyz = pts[:, :3]
     if not len(xyz):
         return _png(rgb)
@@ -2182,6 +2212,489 @@ def auto_label(observer_actor_id: int, format: str = "kitti", output_path: str |
 
 
 # ====================================================================
+# v2.1 — perception evaluation suite (uses ObjIdx + ObjTag from semantic lidar)
+# ====================================================================
+
+@mcp.tool()
+def extract_actor_points(
+    observer_actor_id: int,
+    target_actor_id: int,
+    channels: int = 64,
+    range_m: float = 80.0,
+    points_per_second: int = 600_000,
+    resolution: float = 0.2,
+) -> dict[str, Any]:
+    """Capture a semantic-lidar sweep and return only points belonging to one actor.
+
+    Uses the per-point `ObjIdx` field that CARLA's semantic lidar carries —
+    no detection model required. Useful for per-object density analysis,
+    occlusion checks, or producing instance-mask ground truth.
+
+    Returns counts, centroid, extent, dominant class, and a small BEV PNG of
+    just those points highlighted against the rest of the sweep.
+    """
+    parent = _world().get_actor(observer_actor_id)
+    if parent is None:
+        raise ValueError(f"Observer actor {observer_actor_id} not found.")
+    xyz, tags, obj_idx = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
+    if obj_idx is None:
+        raise RuntimeError("semantic lidar capture missing ObjIdx")
+
+    mask = obj_idx == target_actor_id
+    n = int(mask.sum())
+    if n == 0:
+        return {
+            "actor_id": target_actor_id,
+            "n_points": 0,
+            "image": None,
+            "note": "no lidar returns hit this actor (occluded, out of range, or wrong id)",
+        }
+
+    sel = xyz[mask]
+    centroid = sel.mean(axis=0)
+    extent = (sel.max(axis=0) - sel.min(axis=0)) / 2
+    tags_sel = tags[mask] if tags is not None else None
+    dom_tag = int(np.bincount(tags_sel).argmax()) if tags_sel is not None and len(tags_sel) else 0
+
+    # BEV: target actor's points red, everything else gray
+    colors = np.full((len(xyz), 3), 90, dtype=np.uint8)
+    colors[mask] = (230, 60, 60)
+    bev = _bev_from_points(xyz, colors=colors, range_m=range_m, resolution=resolution)
+    return {
+        "actor_id": target_actor_id,
+        "n_points": n,
+        "centroid_local": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
+        "extent_local": [float(extent[0]), float(extent[1]), float(extent[2])],
+        "dominant_class_id": dom_tag,
+        "dominant_class_name": SEMANTIC_NAMES[dom_tag] if dom_tag < len(SEMANTIC_NAMES) else "?",
+        "image": _png(bev),
+    }
+
+
+@mcp.tool()
+def actor_visibility(
+    observer_actor_id: int,
+    target_actor_id: int | None = None,
+    channels: int = 64,
+    range_m: float = 80.0,
+    points_per_second: int = 600_000,
+) -> dict[str, Any]:
+    """Per-actor lidar hit count + visibility classification.
+
+    Returns each visible actor with: point count, dominant class, and a
+    visibility label:
+        - "high"      ≥ 50 points
+        - "medium"    10–49 points
+        - "low"       1–9 points
+        - "occluded"  not in observer's actor list but 0 hits
+
+    If `target_actor_id` is given, returns just that one. Useful for filtering
+    autolabel pipelines (drop labels with <5 hits = noisy supervision).
+    """
+    w = _world()
+    parent = w.get_actor(observer_actor_id)
+    if parent is None:
+        raise ValueError(f"Observer actor {observer_actor_id} not found.")
+    xyz, tags, obj_idx = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
+    if obj_idx is None:
+        raise RuntimeError("semantic lidar capture missing ObjIdx")
+
+    counts: dict[int, int] = {}
+    dom_tag: dict[int, int] = {}
+    if len(obj_idx):
+        unique_ids, idx_inverse = np.unique(obj_idx, return_inverse=True)
+        for i, aid in enumerate(unique_ids):
+            sel = idx_inverse == i
+            counts[int(aid)] = int(sel.sum())
+            if tags is not None:
+                local_tags = tags[sel]
+                dom_tag[int(aid)] = int(np.bincount(local_tags).argmax())
+
+    def classify(n: int) -> str:
+        if n >= 50:
+            return "high"
+        if n >= 10:
+            return "medium"
+        if n >= 1:
+            return "low"
+        return "occluded"
+
+    if target_actor_id is not None:
+        n = counts.get(target_actor_id, 0)
+        d = dom_tag.get(target_actor_id, 0)
+        return {
+            "actor_id": target_actor_id,
+            "n_points": n,
+            "visibility": classify(n),
+            "dominant_class": SEMANTIC_NAMES[d] if d < len(SEMANTIC_NAMES) else "?",
+        }
+
+    rows = []
+    for aid, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        d = dom_tag.get(aid, 0)
+        rows.append({
+            "actor_id": aid,
+            "n_points": n,
+            "visibility": classify(n),
+            "dominant_class": SEMANTIC_NAMES[d] if d < len(SEMANTIC_NAMES) else "?",
+        })
+    return {"n_actors_visible": len(rows), "actors": rows}
+
+
+@mcp.tool()
+def class_conditional_bev(
+    observer_actor_id: int,
+    classes: list[str],
+    channels: int = 64,
+    range_m: float = 60.0,
+    points_per_second: int = 400_000,
+    resolution: float = 0.2,
+) -> Image:
+    """BEV showing only the specified semantic classes (everything else dimmed).
+
+    Example: ["Car", "Pedestrian"] produces a dynamic-actor map.
+              ["Road", "RoadLine", "Sidewalk"] produces a drivable-surface map.
+
+    Class names are case-insensitive. See SEMANTIC_NAMES for the full list.
+    """
+    parent = _world().get_actor(observer_actor_id)
+    if parent is None:
+        raise ValueError(f"Observer actor {observer_actor_id} not found.")
+    keep = _resolve_class_filter(classes)
+    if keep is None or not keep:
+        raise ValueError("Pass a non-empty list of class names.")
+    xyz, tags, _ = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
+    in_keep = np.isin(tags, list(keep))
+    # Keep-class points get their CityScapes color; others go dim gray
+    colors = np.full((len(xyz), 3), 35, dtype=np.uint8)
+    if in_keep.any():
+        clipped = np.clip(tags[in_keep], 0, len(CITYSCAPES_PALETTE) - 1)
+        colors[in_keep] = CITYSCAPES_PALETTE[clipped]
+    bev = _bev_from_points(xyz, colors=colors, range_m=range_m, resolution=resolution)
+    return _png(bev)
+
+
+@mcp.tool()
+def evaluate_clustering(
+    observer_actor_id: int,
+    eps: float = 0.7,
+    min_samples: int = 6,
+    channels: int = 64,
+    range_m: float = 60.0,
+    points_per_second: int = 400_000,
+    iou_threshold: float = 0.3,
+    resolution: float = 0.2,
+) -> dict[str, Any]:
+    """Run DBSCAN on a semantic-lidar sweep and compare against `ObjIdx` ground truth.
+
+    For every true instance and every predicted cluster, compute point-set IoU
+    (|gt ∩ pred| / |gt ∪ pred|), then greedily match by descending IoU.
+    Reports precision, recall, mean matched IoU, and per-actor results.
+    Renders a BEV PNG: matched points green, false-positive cluster points red,
+    missed ground-truth orange.
+
+    This is the unique selling point — real ML perception evaluation entirely
+    inside CARLA, with sensor-grounded ground truth and no detection model.
+    """
+    from sklearn.cluster import DBSCAN
+
+    parent = _world().get_actor(observer_actor_id)
+    if parent is None:
+        raise ValueError(f"Observer actor {observer_actor_id} not found.")
+    xyz, _, obj_idx = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
+    if obj_idx is None or len(xyz) == 0:
+        raise RuntimeError("no semantic-lidar returns")
+
+    # Drop ground returns from clustering (rough heuristic: z < -1.4 from a 2.5m sensor)
+    above_ground = xyz[:, 2] > -1.4
+    xyz_obj = xyz[above_ground]
+    obj_idx_obj = obj_idx[above_ground]
+
+    if len(xyz_obj) < min_samples:
+        return {"matches": 0, "precision": 0.0, "recall": 0.0, "mean_iou": 0.0,
+                "image": None, "note": "too few non-ground points"}
+
+    # Predict
+    pred = DBSCAN(eps=float(eps), min_samples=int(min_samples)).fit(xyz_obj[:, :2]).labels_
+    # Filter out: noise (-1) for predictions, and the road-bg objidx 0 for truth
+    true_ids = np.unique(obj_idx_obj[obj_idx_obj > 0])
+    pred_ids = np.unique(pred[pred >= 0])
+
+    # Build IoU matrix (true × pred). Cap matrix size for speed.
+    iou_mat = np.zeros((len(true_ids), len(pred_ids)), dtype=np.float32)
+    for i, t in enumerate(true_ids):
+        t_mask = obj_idx_obj == t
+        for j, p in enumerate(pred_ids):
+            p_mask = pred == p
+            inter = int((t_mask & p_mask).sum())
+            if inter == 0:
+                continue
+            union = int((t_mask | p_mask).sum())
+            iou_mat[i, j] = inter / max(1, union)
+
+    # Greedy matching: pick max IoU pair, remove row+col, repeat.
+    matches: list[dict[str, Any]] = []
+    used_t, used_p = set(), set()
+    flat = [(iou_mat[i, j], i, j) for i in range(len(true_ids)) for j in range(len(pred_ids))]
+    flat.sort(reverse=True)
+    for iou, i, j in flat:
+        if iou < iou_threshold:
+            break
+        if i in used_t or j in used_p:
+            continue
+        used_t.add(i); used_p.add(j)
+        matches.append({
+            "true_actor_id": int(true_ids[i]),
+            "pred_cluster_id": int(pred_ids[j]),
+            "iou": float(iou),
+        })
+
+    precision = len(matches) / max(1, len(pred_ids))
+    recall = len(matches) / max(1, len(true_ids))
+    mean_iou = float(np.mean([m["iou"] for m in matches])) if matches else 0.0
+
+    # Visualization: green = matched, red = FP cluster, orange = missed truth
+    colors = np.full((len(xyz_obj), 3), 70, dtype=np.uint8)
+    matched_t_ids = {true_ids[m_i] for m_i in used_t}
+    matched_p_ids = {pred_ids[m_j] for m_j in used_p}
+    for t in true_ids:
+        if t in matched_t_ids:
+            colors[obj_idx_obj == t] = (60, 200, 90)  # green
+        else:
+            colors[obj_idx_obj == t] = (240, 160, 30)  # orange = missed
+    for p in pred_ids:
+        if p not in matched_p_ids:
+            colors[pred == p] = (220, 50, 50)  # red = FP
+    bev = _bev_from_points(xyz_obj, colors=colors, range_m=range_m, resolution=resolution)
+
+    return {
+        "n_true": int(len(true_ids)),
+        "n_pred": int(len(pred_ids)),
+        "matches": matches,
+        "n_matched": len(matches),
+        "precision": float(precision),
+        "recall": float(recall),
+        "mean_iou": mean_iou,
+        "iou_threshold": float(iou_threshold),
+        "image": _png(bev),
+    }
+
+
+@mcp.tool()
+def lidar_to_camera_segmentation(
+    observer_actor_id: int,
+    width: int = 1280,
+    height: int = 720,
+    fov: float = 90.0,
+    channels: int = 64,
+    range_m: float = 80.0,
+    points_per_second: int = 600_000,
+    blend_alpha: float = 0.55,
+) -> Image:
+    """Project semantic-lidar onto an RGB camera frame, color each pixel by class.
+
+    Sparse but pixel-accurate semantic ground truth from sensor calibration
+    alone (no model needed). Each projected point is drawn at its (u, v) in
+    its CityScapes class color, blended over the RGB at `blend_alpha`.
+
+    Useful as: cheap semantic-seg supervision, calibration sanity check,
+    or a visualization for explaining lidar coverage.
+    """
+    parent = _world().get_actor(observer_actor_id)
+    if parent is None:
+        raise ValueError(f"Observer actor {observer_actor_id} not found.")
+
+    rgb = _capture_one_camera(
+        parent, "sensor.camera.rgb", carla.ColorConverter.Raw,
+        width, height, fov, carla.Transform(carla.Location(x=1.6, z=1.7)),
+    )
+    xyz, tags, _ = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
+    if not len(xyz):
+        return _png(rgb)
+
+    # Lidar→camera projection (camera at x=1.6, z=1.7; lidar at z=2.5)
+    cam_offset = np.array([1.6, 0.0, 1.7 - 2.5])
+    pts_cam = xyz - cam_offset
+    fwd = pts_cam[:, 0]
+    keep = fwd > 0.5
+    pts_cam, fwd, tags = pts_cam[keep], fwd[keep], tags[keep]
+    if not len(pts_cam):
+        return _png(rgb)
+
+    f = width / (2.0 * np.tan(np.deg2rad(fov / 2.0)))
+    u = (f * pts_cam[:, 1] / fwd + width / 2).astype(np.int32)
+    v = (-f * pts_cam[:, 2] / fwd + height / 2).astype(np.int32)
+    mask = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    u, v, tags = u[mask], v[mask], tags[mask]
+    cls_idx = np.clip(tags, 0, len(CITYSCAPES_PALETTE) - 1)
+    point_colors = CITYSCAPES_PALETTE[cls_idx]
+
+    out = rgb.copy().astype(np.float32)
+    a = float(blend_alpha)
+    for r in range(-1, 2):
+        for c in range(-1, 2):
+            uu = np.clip(u + c, 0, width - 1)
+            vv = np.clip(v + r, 0, height - 1)
+            out[vv, uu] = (1.0 - a) * out[vv, uu] + a * point_colors
+    out_u8 = np.clip(out, 0, 255).astype(np.uint8)
+    return _png(out_u8)
+
+
+@mcp.tool()
+def check_sensor_consistency(
+    observer_actor_id: int,
+    width: int = 800,
+    height: int = 450,
+    fov: float = 90.0,
+    channels: int = 64,
+    range_m: float = 80.0,
+    points_per_second: int = 600_000,
+) -> dict[str, Any]:
+    """Cross-validate semantic camera vs semantic lidar.
+
+    Captures a semantic camera image (each pixel's RED channel encodes the
+    CARLA class id) and a semantic lidar sweep, projects each lidar point
+    into the camera, and compares the lidar's class to the camera's class
+    at the same pixel. Reports per-class agreement % plus an overlay PNG
+    that highlights disagreements in red.
+
+    A sub-50% agreement on common classes usually means the lidar mounting
+    transform drifted from the camera's, or one of the sensors fell behind
+    in async mode.
+    """
+    parent = _world().get_actor(observer_actor_id)
+    if parent is None:
+        raise ValueError(f"Observer actor {observer_actor_id} not found.")
+
+    # Capture semantic camera in RAW so the red channel is the class id.
+    cam_classid_bgra = _capture_one_camera(
+        parent, "sensor.camera.semantic_segmentation",
+        carla.ColorConverter.Raw, width, height, fov,
+        carla.Transform(carla.Location(x=1.6, z=1.7)),
+    )
+    # _capture_one_camera returns RGB after BGRA→RGB swap → red = class_id is now red[..., 0].
+    cam_classes = cam_classid_bgra[..., 0].astype(np.int32)
+
+    xyz, tags, _ = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
+    if not len(xyz):
+        return {"agreement": None, "note": "no lidar points captured"}
+
+    cam_offset = np.array([1.6, 0.0, 1.7 - 2.5])
+    pts_cam = xyz - cam_offset
+    fwd = pts_cam[:, 0]
+    keep = fwd > 0.5
+    pts_cam, fwd, tags = pts_cam[keep], fwd[keep], tags[keep]
+    if not len(pts_cam):
+        return {"agreement": None, "note": "all lidar points behind the camera"}
+
+    f = width / (2.0 * np.tan(np.deg2rad(fov / 2.0)))
+    u = (f * pts_cam[:, 1] / fwd + width / 2).astype(np.int32)
+    v = (-f * pts_cam[:, 2] / fwd + height / 2).astype(np.int32)
+    in_frame = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    u, v, tags = u[in_frame], v[in_frame], tags[in_frame]
+    cam_at_pt = cam_classes[v, u]
+    agree = (cam_at_pt == tags)
+
+    # Per-class breakdown
+    per_class: dict[str, dict[str, int]] = {}
+    for cls_id in np.unique(tags):
+        sel = tags == cls_id
+        name = SEMANTIC_NAMES[int(cls_id)] if cls_id < len(SEMANTIC_NAMES) else f"id_{cls_id}"
+        per_class[name] = {
+            "n_points": int(sel.sum()),
+            "n_agree": int(agree[sel].sum()),
+            "agreement_pct": float(100.0 * agree[sel].sum() / max(1, sel.sum())),
+        }
+
+    # Overlay PNG: cam (colorized via palette) with disagreements highlighted red
+    cam_rgb = CITYSCAPES_PALETTE[np.clip(cam_classes, 0, len(CITYSCAPES_PALETTE) - 1)]
+    cam_rgb = cam_rgb.astype(np.uint8)
+    disagree = ~agree
+    if disagree.any():
+        for r in range(-1, 2):
+            for c in range(-1, 2):
+                uu = np.clip(u[disagree] + c, 0, width - 1)
+                vv = np.clip(v[disagree] + r, 0, height - 1)
+                cam_rgb[vv, uu] = (240, 50, 50)
+
+    return {
+        "n_points_in_frame": int(len(u)),
+        "agreement_overall_pct": float(100.0 * agree.sum() / max(1, len(agree))),
+        "per_class": per_class,
+        "image": _png(cam_rgb),
+    }
+
+
+@mcp.tool()
+def semantic_voxelize(
+    observer_actor_id: int,
+    voxel_size: float = 0.5,
+    range_m: float = 50.0,
+    z_range: list[float] | None = None,
+    classes: list[str] | None = None,
+    channels: int = 64,
+    points_per_second: int = 600_000,
+) -> dict[str, Any]:
+    """Voxelize a semantic-lidar sweep; each occupied voxel keeps the dominant class.
+
+    Direct ground truth for occupancy networks (OccNet, BEVFusion, …).
+    Optionally filter to a subset of class names before voxelizing.
+    """
+    parent = _world().get_actor(observer_actor_id)
+    if parent is None:
+        raise ValueError(f"Observer actor {observer_actor_id} not found.")
+    xyz, tags, _ = _capture_one_lidar(parent, True, channels, range_m, points_per_second)
+    keep = _resolve_class_filter(classes)
+    if keep is not None and keep:
+        sel = np.isin(tags, list(keep))
+        xyz, tags = xyz[sel], tags[sel]
+
+    z_lo, z_hi = (z_range or [-2.0, 4.0])
+    in_box = (
+        (np.abs(xyz[:, 0]) < range_m)
+        & (np.abs(xyz[:, 1]) < range_m)
+        & (xyz[:, 2] > z_lo)
+        & (xyz[:, 2] < z_hi)
+    )
+    xyz = xyz[in_box]
+    tags = tags[in_box]
+    if not len(xyz):
+        return {"voxels": 0, "shape": [0, 0, 0]}
+
+    nx = int(2 * range_m / voxel_size)
+    ny = nx
+    nz = int((z_hi - z_lo) / voxel_size)
+    ix = ((xyz[:, 0] + range_m) / voxel_size).astype(np.int32)
+    iy = ((xyz[:, 1] + range_m) / voxel_size).astype(np.int32)
+    iz = ((xyz[:, 2] - z_lo) / voxel_size).astype(np.int32)
+    keys = ix * (ny * nz) + iy * nz + iz
+
+    # Per-voxel dominant class via groupby
+    order = np.argsort(keys)
+    keys_sorted, tags_sorted = keys[order], tags[order]
+    boundaries = np.concatenate(([0], np.where(np.diff(keys_sorted) != 0)[0] + 1, [len(keys_sorted)]))
+    occupied = []
+    for s, e in zip(boundaries[:-1], boundaries[1:]):
+        k = int(keys_sorted[s])
+        cls_counts = np.bincount(tags_sorted[s:e])
+        dom = int(cls_counts.argmax())
+        occupied.append((k, int(e - s), dom))
+
+    return {
+        "voxel_size": voxel_size,
+        "shape": [nx, ny, nz],
+        "n_voxels_occupied": len(occupied),
+        "occupancy_ratio": float(len(occupied) / (nx * ny * nz)),
+        "class_filter": classes,
+        "occupied_voxels_truncated": [
+            [int(k // (ny * nz)), int((k % (ny * nz)) // nz), int(k % nz),
+             int(cnt), int(dom_cls), SEMANTIC_NAMES[dom_cls] if dom_cls < len(SEMANTIC_NAMES) else "?"]
+            for k, cnt, dom_cls in occupied[:5000]
+        ],
+    }
+
+
+# ====================================================================
 # v2.0 — visualization & scenarios
 # ====================================================================
 
@@ -2271,8 +2784,31 @@ def spawn_adversarial(
 
     if behavior in ("cut_in", "sudden_brake"):
         bp = random.choice(list(w.get_blueprint_library().filter("vehicle.tesla.model3")))
-        sp = spawn_t or random.choice(w.get_map().get_spawn_points())
-        vehicle = w.spawn_actor(bp, sp)
+        # Retry with several distances + map spawn fallbacks if the spot is occupied.
+        candidates: list[carla.Transform] = []
+        if target is not None:
+            t = target.get_transform()
+            fwd = t.get_forward_vector()
+            for d in (distance_m, distance_m * 0.7, distance_m * 1.4,
+                      distance_m * 1.8, distance_m * 0.5):
+                candidates.append(carla.Transform(
+                    carla.Location(
+                        x=t.location.x + fwd.x * d,
+                        y=t.location.y + fwd.y * d,
+                        z=t.location.z + 0.5,
+                    ),
+                    carla.Rotation(yaw=t.rotation.yaw),
+                ))
+        spawn_points = w.get_map().get_spawn_points()
+        random.shuffle(spawn_points)
+        candidates.extend(spawn_points[:8])  # up to 8 random fallbacks
+        vehicle = None
+        for sp in candidates:
+            vehicle = w.try_spawn_actor(bp, sp)
+            if vehicle is not None:
+                break
+        if vehicle is None:
+            raise RuntimeError("Could not find a clear spawn position for adversarial vehicle.")
         _track(vehicle)
         tm = _get_client().get_trafficmanager()
         vehicle.set_autopilot(True, tm.get_port())

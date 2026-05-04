@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "carla-mcp"
-version = "2.0.0"
+version = "2.1.0"
 description = "MCP connector for the CARLA autonomous driving simulator. Gives Claude eyes (sensor capture) and hands (actor & scenario control) inside CARLA."
 readme = "README.md"
 license = { text = "MIT" }
